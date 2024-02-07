@@ -46,7 +46,9 @@ B_SYS, E_SYS = "<<SYS>>\n", "\n<</SYS>>\n\n"
 
 SPECIAL_TAGS = [B_INST, E_INST, "<<SYS>>", "<</SYS>>"]
 UNSAFE_ERROR = "Error: special tags are not allowed as part of the prompt."
+k = 2
 
+CKT_PATH = "../llama-2-7b-chat/consolidated.00.pth"
 
 class Llama:
     @staticmethod
@@ -188,6 +190,9 @@ class Llama:
             if temperature > 0:
                 probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
                 next_token = sample_top_p(probs, top_p)
+                print("PROBS: ", probs)
+                print("next token: ", next_token)
+                print("------------------------------------------")
             else:
                 next_token = torch.argmax(logits[:, -1], dim=-1)
 
@@ -280,6 +285,63 @@ class Llama:
                 for t, logprobs_i in zip(generation_tokens, generation_logprobs)
             ]
         return [{"generation": self.tokenizer.decode(t)} for t in generation_tokens]
+
+
+    def top_words_distributions(
+        self,
+        prompt: str,
+        repeats: int = 100,
+    ) -> torch.Tensor:
+        """
+        Generate top 2 words, feed each word into the model, get each word's distributions, and sum the distributions.
+
+        Args:
+            prompt (str): The initial prompt.
+            repeats (int, optional): Number of times to repeat the process. Defaults to 100.
+
+        Returns:
+            torch.Tensor: Summed distributions of the top words.
+        """
+        summed_distributions = torch.zeros(self.model.params.vocab_size, dtype=torch.float, device='cuda')
+        prompt_tokens = [self.tokenizer.encode(prompt, bos=True, eos=False)]
+        for _ in range(repeats):
+            print("PROMPT to: ", prompt_tokens)
+            top_words, _ = self.generate(
+                prompt_tokens=prompt_tokens,
+                max_gen_len=1,  # Generate only one token
+                temperature=0.6,  # 0 is No randomness
+                top_p=0.9,  # Return the most likely token
+            )
+            top_words = [word[0] for word in top_words]  # Extract the top word for each prompt
+            prompt_tokens[0].extend(top_words)
+            print("PROMPT2 to: ", prompt_tokens)
+
+            # Feed each word into the model and get distributions
+            for word in top_words:
+                word_distribution = self.word_distribution(word)
+                summed_distributions += word_distribution
+
+        return summed_distributions
+
+    def word_distribution(self, word: int) -> torch.Tensor:
+        """
+        Get the distribution of a word from the model.
+
+        Args:
+            word (int): The word token.
+
+        Returns:
+            torch.Tensor: Token distribution for the word.
+        """
+        prompt_tokens = [[word]]
+        _, distribution = self.generate(
+            prompt_tokens=prompt_tokens,
+            max_gen_len=1,  # Generate only one token
+            temperature=0,  # No randomness
+            top_p=0.9,  # Return the most likely token
+            logprobs=True,  # Obtain token log probabilities
+        )
+        return torch.exp(torch.tensor(distribution[0], dtype=torch.float, device='cuda'))
 
     def chat_completion(
         self,
@@ -411,10 +473,6 @@ def sample_top_p(probs, p):
         exceeds the threshold p. The distribution is renormalized based on the selected tokens.
 
     """
-    print(probs)
-    print(p)
-    print(probs.shape)
-    print("--------------")
     probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
     mask = probs_sum - probs_sort > p
@@ -422,6 +480,4 @@ def sample_top_p(probs, p):
     probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
     next_token = torch.multinomial(probs_sort, num_samples=1)
     next_token = torch.gather(probs_idx, -1, next_token)
-    print("NEXT TOKEN ", next_token)
-    print("#####")
     return next_token
