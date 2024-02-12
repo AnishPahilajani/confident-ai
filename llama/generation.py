@@ -50,6 +50,35 @@ k = 2
 
 CKT_PATH = "../llama-2-7b-chat/consolidated.00.pth"
 
+def sample_top_p_k(probs, p, k):
+    """
+    Perform top-p (nucleus) sampling on a probability distribution.
+
+    Args:
+        probs (torch.Tensor): Probability distribution tensor.
+        p (float): Probability threshold for top-p sampling.
+
+    Returns:
+        torch.Tensor: Sampled token indices.
+
+    Note:
+        Top-p sampling selects the smallest set of tokens whose cumulative probability mass
+        exceeds the threshold p. The distribution is renormalized based on the selected tokens.
+
+    """
+    probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
+    probs_sum = torch.cumsum(probs_sort, dim=-1)
+    mask = probs_sum - probs_sort > p
+    probs_sort[mask] = 0.0
+    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+    next_token = torch.multinomial(probs_sort, num_samples=1)
+    ret = []
+    for i in range(k):
+        next_token = torch.gather(probs_idx, -1, torch.tensor([[i]]))
+        ret.append(next_token)
+    return ret
+
+
 class Llama:
     @staticmethod
     def build(
@@ -190,9 +219,6 @@ class Llama:
             if temperature > 0:
                 probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
                 next_token = sample_top_p(probs, top_p)
-                print("PROBS: ", probs)
-                print("next token: ", next_token)
-                print("------------------------------------------")
             else:
                 next_token = torch.argmax(logits[:, -1], dim=-1)
 
@@ -290,38 +316,82 @@ class Llama:
     def top_words_distributions(
         self,
         prompt: str,
-        repeats: int = 100,
-    ) -> torch.Tensor:
+        repeats: int = 8,
+        max_gen_len: int = 1,
+        temperature: float = 0.6,
+        top_p: float =0.9,
+        top_k: int =3
+    ):
         """
         Generate top 2 words, feed each word into the model, get each word's distributions, and sum the distributions.
 
         Args:
             prompt (str): The initial prompt.
-            repeats (int, optional): Number of times to repeat the process. Defaults to 100.
+            repeats (int, optional): Number of times to repeat the process. Defaults to 1.
 
         Returns:
             torch.Tensor: Summed distributions of the top words.
         """
+        
+        
         summed_distributions = torch.zeros(self.model.params.vocab_size, dtype=torch.float, device='cuda')
         prompt_tokens = [self.tokenizer.encode(prompt, bos=True, eos=False)]
-        for _ in range(repeats):
-            print("PROMPT to: ", prompt_tokens)
-            top_words, _ = self.generate(
-                prompt_tokens=prompt_tokens,
-                max_gen_len=1,  # Generate only one token
-                temperature=0.6,  # 0 is No randomness
-                top_p=0.9,  # Return the most likely token
+        print("PROMPT Token: ", prompt_tokens)
+        
+        params = self.model.params
+        bsz = len(prompt_tokens)
+        assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)
+
+        min_prompt_len = min(len(t) for t in prompt_tokens)
+        max_prompt_len = max(len(t) for t in prompt_tokens)
+        assert max_prompt_len <= params.max_seq_len
+        total_len = min(params.max_seq_len, max_gen_len + max_prompt_len)
+
+        pad_id = self.tokenizer.pad_id
+        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device="cuda")
+        for k, t in enumerate(prompt_tokens):
+            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
+
+        prev_pos = 0
+        eos_reached = torch.tensor([False] * bsz, device="cuda")
+        input_text_mask = tokens != pad_id
+        if min_prompt_len == total_len:
+            logits = self.model.forward(tokens, prev_pos)
+            token_logprobs = -F.cross_entropy(
+                input=logits.transpose(1, 2),
+                target=tokens,
+                reduction="none",
+                ignore_index=pad_id,
             )
-            top_words = [word[0] for word in top_words]  # Extract the top word for each prompt
-            prompt_tokens[0].extend(top_words)
-            print("PROMPT2 to: ", prompt_tokens)
 
-            # Feed each word into the model and get distributions
-            for word in top_words:
-                word_distribution = self.word_distribution(word)
-                summed_distributions += word_distribution
+        #for cur_pos in range(min_prompt_len, total_len):
+        cur_pos = total_len-1
+        print("TOKENS: ", tokens, tokens.shape, total_len)
+        logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+        if temperature > 0:
+            probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
+            for _ in range(repeats):
+                next_token = sample_top_p_k(probs, top_p, top_k) # return slist of next top_k tokens
+                print("Distribution: ", probs)
+                print("top k tokens: ", next_token)
+                print("------tokens + next_token[0] -----tokens + next_token[k-1]----")
+                add_new_tokens_probs = []
+                total_len+= 1
+                cur_pos+=1
+                for nt in next_token:
+                    added_token_tensor = torch.cat([tokens[:, :-1], nt, tokens[:, -1:]], dim=1)
+                    print("NEW SHAPE: ", added_token_tensor, added_token_tensor.shape)
+                    print("prev_pos:", prev_pos)
+                    print("cur_pos:", cur_pos)
+                    logits_new = self.model.forward(added_token_tensor[:, prev_pos:cur_pos], prev_pos)
+                    probs_new = torch.softmax(logits_new[:, -1] / temperature, dim=-1)
+                    add_new_tokens_probs.append(probs_new)
+                print("PROBS new ", add_new_tokens_probs)
+                stacked_probs = torch.stack(add_new_tokens_probs)
+                tokens = added_token_tensor
+                probs = torch.sum(stacked_probs, dim=0)
 
-        return summed_distributions
+        return probs
 
     def word_distribution(self, word: int) -> torch.Tensor:
         """

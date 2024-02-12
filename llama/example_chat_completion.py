@@ -84,16 +84,16 @@ If a question does not make any sense, or is not factually coherent, explain why
             }
         ],
     ]
-    dialogs: List[Dialog] = [
-        [{"role": "user", "content": "Hello"}]]
-    results = generator.chat_completion(
-        dialogs,  # type: ignore
-        max_gen_len=max_gen_len,
-        temperature=temperature,
-        top_p=top_p,
-    )
+    # dialogs: List[Dialog] = [
+    #     [{"role": "user", "content": "Hello"}]]
+    # results = generator.chat_completion(
+    #     dialogs,  # type: ignore
+    #     max_gen_len=max_gen_len,
+    #     temperature=temperature,
+    #     top_p=top_p,
+    # )
     
-    summed_distributions = generator.top_words_distributions(prompt="Hello", repeats=3)
+    summed_distributions = generator.top_words_distributions(prompt="Hello") # updates prompt
     print("SUMMED: ", summed_distributions)
     
 
